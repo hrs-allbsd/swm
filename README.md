@@ -4,7 +4,7 @@
 
 swm is a small X11 window manager for running applications in Xsixel.
 It is written in C and depends only on Xlib. It has no window-switching
-commands, workspaces, launcher, or configuration file; use screen or tmux
+commands, workspaces, or configuration file; use screen or tmux
 in the terminal for session management.
 
 ## Behavior
@@ -53,9 +53,17 @@ Start [Xsixel](https://github.com/csdvrx/xsixel), then run swm on the same
 X server in place of ratpoison. For example, if Xsixel uses DISPLAY `:1`:
 
 ```sh
-DISPLAY=:1 ./swm &
-DISPLAY=:1 xterm
+DISPLAY=:1 ./swm -exec xterm
 ```
+
+The `-exec` option and a command are required. All following arguments
+are passed directly to the application; commands are looked up in `PATH`.
+For example, `swm -exec xterm -e top` starts xterm with its own arguments.
+For shell syntax, invoke a shell explicitly: `swm -exec sh -c 'exec xterm'`.
+The application inherits the environment, including `DISPLAY`, and starts
+after the window manager is ready. If it cannot be executed, swm reports
+an error and exits with a nonzero status. swm continues running after the
+application exits. Use `swm --help` to show usage without starting X11.
 
 swm refuses to start if another window manager is already running.
 To stop swm itself, use the launching shell's job control or
@@ -77,7 +85,9 @@ make test
 The tests also require Xvfb and xdotool. They use a separate virtual X
 server to check maximization, resize requests, transient, nested, and
 typed dialogs, focus restoration, remapping, Alt-w, lock keys, the close
-button, and rejection of a second window manager.
+button, and rejection of a second window manager. They also check the
+required `-exec` option, application startup, argument forwarding, and
+execution failures.
 
 Operation with Xsixel itself and real browsers still needs verification.
 Full ICCCM or EWMH support is outside the scope of this project. swm does

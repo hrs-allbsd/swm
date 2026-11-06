@@ -14,6 +14,23 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT HUP INT TERM
+# Invalid invocations must fail before attempting to connect to X11.
+reject_usage() {
+    if DISPLAY= ./swm "$@" >"$work/usage.log" 2>&1; then
+        echo 'FAIL: invalid invocation succeeded'; exit 1
+    fi
+    case $(cat "$work/usage.log") in
+        'Usage: swm -exec command [args ...]') ;;
+        *) cat "$work/usage.log"; exit 1 ;;
+    esac
+}
+reject_usage
+reject_usage -exec
+reject_usage -exec ''
+reject_usage --unknown
+DISPLAY= ./swm --help >"$work/help.log"
+echo 'PASS: required -exec and help without DISPLAY'
+
 Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$work/display" >"$work/xvfb.log" 2>&1 &
 xvfb_pid=$!
 i=0
@@ -24,13 +41,34 @@ while test ! -s "$work/display"; do
 done
 DISPLAY=:$(cat "$work/display")
 export DISPLAY
-./swm >"$work/wm.log" 2>&1 &
+if ./swm -exec /swm-test-nonexistent-command >"$work/exec.log" 2>&1; then
+    echo 'FAIL: nonexistent command succeeded'; exit 1
+fi
+case $(cat "$work/exec.log") in
+    'swm: cannot execute /swm-test-nonexistent-command:'*) ;;
+    *) cat "$work/exec.log"; exit 1 ;;
+esac
+./swm -exec sh tests/launch.sh 'argument with spaces' '$literal' \
+    "$work/result" >"$work/wm.log" 2>&1 &
 wm_pid=$!
 sleep 0.2
-if ./swm >"$work/second.log" 2>&1; then
+if ./swm -exec sh -c 'touch "$1"' sh "$work/unexpected" \
+    >"$work/second.log" 2>&1; then
     echo 'FAIL: second WM succeeded'; exit 1
 fi
-./tests/client
+case $(cat "$work/second.log") in
+    'swm: another window manager is running') ;;
+    *) cat "$work/second.log"; exit 1 ;;
+esac
+test ! -e "$work/unexpected"
+i=0
+while test ! -s "$work/result"; do
+    i=$((i + 1))
+    if test "$i" -gt 100 || ! kill -0 "$wm_pid" 2>/dev/null; then
+        cat "$work/wm.log"; echo 'FAIL: launched tests did not complete'; exit 1
+    fi
+    sleep 0.1
+done
 kill -0 "$wm_pid"
-test ! -s "$work/wm.log" || { cat "$work/wm.log"; exit 1; }
-echo 'PASS: second WM rejected'
+cat "$work/wm.log"
+echo 'PASS: application launch, literal arguments, exec failure, second WM rejected'

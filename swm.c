@@ -6,14 +6,21 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <sys/wait.h>
+
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <errno.h>
 #include <locale.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+extern char **environ;
 
 #define	BAR	24
 
@@ -308,6 +315,42 @@ grab_keys(void)
 		    root, False, GrabModeAsync, GrabModeAsync);
 }
 
+static void
+reap_children(int signo)
+{
+	int saved_errno;
+
+	(void)signo;
+	saved_errno = errno;
+	while (waitpid(-1, NULL, WNOHANG) > 0)
+		;
+	errno = saved_errno;
+}
+
+static int
+start_application(char **argv)
+{
+	posix_spawn_file_actions_t actions;
+	pid_t pid;
+	int error;
+
+	error = posix_spawn_file_actions_init(&actions);
+	if (error == 0) {
+		error = posix_spawn_file_actions_addclose(&actions,
+		    ConnectionNumber(dpy));
+		if (error == 0)
+			error = posix_spawnp(&pid, argv[0], &actions, NULL,
+			    argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+	}
+	if (error != 0) {
+		fprintf(stderr, "swm: cannot execute %s: %s\n", argv[0],
+		    strerror(error));
+		return (-1);
+	}
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -319,12 +362,17 @@ main(int argc, char **argv)
 	char **missing, *fallback;
 	unsigned int count, i;
 	int nmissing;
+	struct sigaction sa;
 
-	if (argc > 1) {
-		puts("swm: minimal X11 window manager\n"
-		    "Usage: swm\nAlt-w: close focused window");
-		return (argc == 2 && (strcmp(argv[1], "--help") == 0 ||
-		    strcmp(argv[1], "-h") == 0) ? 0 : 1);
+	if (argc == 2 && (strcmp(argv[1], "--help") == 0 ||
+	    strcmp(argv[1], "-h") == 0)) {
+		puts("Usage: swm -exec command [args ...]\n"
+		    "Alt-w: close focused window");
+		return (0);
+	}
+	if (argc < 3 || strcmp(argv[1], "-exec") != 0 || argv[2][0] == '\0') {
+		fputs("Usage: swm -exec command [args ...]\n", stderr);
+		return (1);
 	}
 	setlocale(LC_CTYPE, "");
 	dpy = XOpenDisplay(NULL);
@@ -368,6 +416,21 @@ main(int argc, char **argv)
 		}
 		if (children)
 			XFree(children);
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = reap_children;
+	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+		perror("swm: sigaction");
+		XCloseDisplay(dpy);
+		return (1);
+	}
+	/* Finish setting up the window manager before starting the client. */
+	XSync(dpy, False);
+	if (start_application(&argv[2]) == -1) {
+		XCloseDisplay(dpy);
+		return (1);
 	}
 	for (;;) {
 		XNextEvent(dpy, &e);
