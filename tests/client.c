@@ -12,6 +12,7 @@
 #include <X11/keysym.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define CHECK(expr)                                                     \
@@ -77,6 +78,39 @@ geometry(Window w, int x, int y, int width, int height)
 }
 
 static void
+titlebar(Window w)
+{
+	XWindowAttributes a, b;
+	XImage *image;
+	Window rr, parent, *children;
+	unsigned int count, i;
+	int found;
+
+	pause_events();
+	CHECK(XGetWindowAttributes(d, w, &a));
+	CHECK(XQueryTree(d, root, &rr, &parent, &children, &count));
+	found = 0;
+	for (i = 0; i < count; i++) {
+		CHECK(XGetWindowAttributes(d, children[i], &b));
+		if (b.override_redirect && b.map_state == IsViewable &&
+		    b.x == a.x && b.y == a.y - 24 && b.width == a.width &&
+		    b.height == 24)
+			found = 1;
+	}
+	XFree(children);
+	CHECK(found);
+	/* Read the composed root image to catch obscured title bars. */
+	image = XGetImage(d, root, a.x, a.y - 24, a.width, 24,
+	    AllPlanes, ZPixmap);
+	CHECK(image != NULL);
+	CHECK(XGetPixel(image, 1, 1) != BlackPixel(d, DefaultScreen(d)));
+	CHECK(XGetPixel(image, a.width - 16, 8) ==
+	    WhitePixel(d, DefaultScreen(d)));
+	CHECK(XGetPixel(image, 1, 23) == WhitePixel(d, DefaultScreen(d)));
+	XDestroyImage(image);
+}
+
+static void
 focused(Window expected)
 {
 	Window w;
@@ -119,7 +153,7 @@ deleted(Window expected)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
 	XEvent click = { 0 };
 	XWindowAttributes a;
@@ -130,15 +164,25 @@ main(void)
 	d = XOpenDisplay(NULL);
 	CHECK(d);
 	root = DefaultRootWindow(d);
+	if (argc == 5 && strcmp(argv[1], "--check") == 0) {
+		main = strtoul(argv[2], NULL, 0);
+		geometry(main, 0, 24, atoi(argv[3]), atoi(argv[4]) - 24);
+		titlebar(main);
+		XCloseDisplay(d);
+		return (0);
+	}
+	CHECK(argc == 1);
 	del = XInternAtom(d, "WM_DELETE_WINDOW", False);
 	main = create("Main", None, 0);
 	geometry(main, 0, 24, 800, 576);
 	focused(main);
+	titlebar(main);
 	XMoveResizeWindow(d, main, 50, 50, 100, 100);
 	geometry(main, 0, 24, 800, 576);
 	dialog = create("Confirm", main, 0);
 	geometry(dialog, 250, 252, 300, 120);
 	focused(dialog);
+	titlebar(dialog);
 	nested = create("Nested", dialog, 0);
 	geometry(nested, 250, 252, 300, 120);
 	focused(nested);
@@ -188,6 +232,26 @@ main(void)
 	XDestroyWindow(d, typed);
 	XFlush(d);
 	focused(main);
+	if (getenv("SWM_TEST_RESIZE") != NULL) {
+		CHECK(system("xrandr --output VNC-0 --mode 640x480") == 0);
+		geometry(main, 0, 24, 640, 456);
+		titlebar(main);
+		dialog = create("Resize dialog", main, 0);
+		geometry(dialog, 170, 192, 300, 120);
+		CHECK(system("xrandr --output VNC-0 --mode 1024x768") == 0);
+		geometry(main, 0, 24, 1024, 744);
+		geometry(dialog, 362, 336, 300, 120);
+		titlebar(main);
+		titlebar(dialog);
+		CHECK(system("xrandr --output VNC-0 --mode 800x600") == 0);
+		geometry(main, 0, 24, 800, 576);
+		geometry(dialog, 250, 252, 300, 120);
+		XDestroyWindow(d, dialog);
+		XFlush(d);
+		focused(main);
+		titlebar(main);
+		puts("PASS: real RandR shrink/grow/restore and dialog layout");
+	}
 	CHECK(system("xdotool key Caps_Lock") == 0);
 	close_key();
 	deleted(main);

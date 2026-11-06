@@ -12,7 +12,7 @@ PREFIX = /usr/local
 all: swm
 
 swm: swm.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) `$(PKG_CONFIG) --cflags x11` $(LDFLAGS) -o $@ swm.c `$(PKG_CONFIG) --libs x11`
+	$(CC) $(CPPFLAGS) $(CFLAGS) `$(PKG_CONFIG) --cflags x11 xrandr` $(LDFLAGS) -o $@ swm.c `$(PKG_CONFIG) --libs x11 xrandr`
 
 install: swm
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
@@ -24,7 +24,10 @@ clean:
 test: swm tests/client
 	sh tests/smoke.sh
 
-tests/client: tests/client.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) `$(PKG_CONFIG) --cflags x11` $(LDFLAGS) -o $@ tests/client.c `$(PKG_CONFIG) --libs x11`
+test-resize: swm tests/client
+	SWM_TEST_SERVER=Xvnc SWM_TEST_RESIZE=1 sh tests/smoke.sh
 
-.PHONY: all install clean test
+tests/client: tests/client.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) `$(PKG_CONFIG) --cflags x11 xrandr` $(LDFLAGS) -o $@ tests/client.c `$(PKG_CONFIG) --libs x11 xrandr`
+
+.PHONY: all install clean test test-resize

@@ -12,13 +12,17 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/extensions/Xrandr.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 extern char **environ;
 
@@ -39,6 +43,10 @@ static Atom protocols, delete_window, take_focus, wm_state, type, dialog_type,
     net_name, utf8;
 static int sw, sh, startup_error;
 static unsigned int numlock;
+static unsigned long bar_pixel;
+static int randr_event, randr_available;
+static int child_pipe[2] = { -1, -1 };
+static pid_t application_pid;
 
 static int
 error(Display *d, XErrorEvent *e)
@@ -126,7 +134,15 @@ draw(Client *c)
 		XFree(text);
 	if (name)
 		XFree(name);
-	XDrawString(dpy, c->bar, gc, c->width - 18, 16, "X", 1);
+	XDrawLine(dpy, c->bar, gc, 0, BAR - 1, c->width - 1, BAR - 1);
+	if (c->width >= BAR) {
+		XDrawLine(dpy, c->bar, gc, c->width - BAR, 0,
+		    c->width - BAR, BAR - 1);
+		XDrawLine(dpy, c->bar, gc, c->width - 16, 8,
+		    c->width - 8, 16);
+		XDrawLine(dpy, c->bar, gc, c->width - 16, 16,
+		    c->width - 8, 8);
+	}
 }
 
 static void
@@ -138,12 +154,12 @@ layout(Client *c)
 		c->x = 0;
 		c->y = BAR;
 		c->width = sw;
-		c->height = sh - BAR;
+		c->height = sh > BAR ? sh - BAR : 1;
 	} else {
 		if (c->width > sw)
 			c->width = sw;
 		if (c->height > sh - BAR)
-			c->height = sh - BAR;
+			c->height = sh > BAR ? sh - BAR : 1;
 		c->x = (sw - c->width) / 2;
 		c->y = BAR + (sh - BAR - c->height) / 2;
 	}
@@ -243,7 +259,7 @@ manage(Window w)
 	c->width = a.width;
 	c->height = a.height;
 	attrs.override_redirect = True;
-	attrs.background_pixel = BlackPixel(dpy, DefaultScreen(dpy));
+	attrs.background_pixel = bar_pixel;
 	attrs.event_mask = ExposureMask | ButtonPressMask;
 	c->bar = XCreateWindow(dpy, root, 0, 0, 1, BAR, 0, CopyFromParent,
 	    InputOutput, CopyFromParent,
@@ -258,6 +274,7 @@ manage(Window w)
 	XMapWindow(dpy, w);
 	XMapWindow(dpy, c->bar);
 	focus(c, CurrentTime);
+	draw(c);
 }
 
 static void
@@ -316,22 +333,59 @@ grab_keys(void)
 }
 
 static void
-reap_children(int signo)
+child_changed(int signo)
 {
 	int saved_errno;
+	char byte = 0;
 
 	(void)signo;
 	saved_errno = errno;
-	while (waitpid(-1, NULL, WNOHANG) > 0)
-		;
+	(void)write(child_pipe[1], &byte, 1);
 	errno = saved_errno;
+}
+
+static int
+watch_child(void)
+{
+	struct sigaction sa;
+	int i, flags;
+
+	if (pipe(child_pipe) == -1)
+		return (-1);
+	for (i = 0; i < 2; i++) {
+		flags = fcntl(child_pipe[i], F_GETFL);
+		if (flags == -1 || fcntl(child_pipe[i], F_SETFL,
+		    flags | O_NONBLOCK) == -1 ||
+		    fcntl(child_pipe[i], F_SETFD, FD_CLOEXEC) == -1)
+			return (-1);
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = child_changed;
+	sa.sa_flags = SA_NOCLDSTOP;
+	sigemptyset(&sa.sa_mask);
+	return (sigaction(SIGCHLD, &sa, NULL));
+}
+
+static void
+resize_screen(int width, int height)
+{
+	Client *c;
+
+	if (width < 1 || height < 1 || (width == sw && height == sh))
+		return;
+	sw = width;
+	sh = height;
+	for (c = clients; c; c = c->next) {
+		layout(c);
+		draw(c);
+	}
+	XFlush(dpy);
 }
 
 static int
 start_application(char **argv)
 {
 	posix_spawn_file_actions_t actions;
-	pid_t pid;
 	int error;
 
 	error = posix_spawn_file_actions_init(&actions);
@@ -339,8 +393,8 @@ start_application(char **argv)
 		error = posix_spawn_file_actions_addclose(&actions,
 		    ConnectionNumber(dpy));
 		if (error == 0)
-			error = posix_spawnp(&pid, argv[0], &actions, NULL,
-			    argv, environ);
+			error = posix_spawnp(&application_pid, argv[0], &actions,
+			    NULL, argv, environ);
 		posix_spawn_file_actions_destroy(&actions);
 	}
 	if (error != 0) {
@@ -354,24 +408,27 @@ start_application(char **argv)
 int
 main(int argc, char **argv)
 {
-	Client *c, *p;
+	Client *c;
 	XEvent e;
+	XColor color, exact;
+	struct pollfd fds[2];
+	pid_t child;
 	XFontStruct *font;
 	XWindowAttributes a;
 	Window r, parent, *children = NULL;
 	char **missing, *fallback;
 	unsigned int count, i;
-	int nmissing;
-	struct sigaction sa;
+	int nmissing, randr_error, status, exit_status;
+	char bytes[64];
 
 	if (argc == 2 && (strcmp(argv[1], "--help") == 0 ||
 	    strcmp(argv[1], "-h") == 0)) {
-		puts("Usage: swm -exec command [args ...]\n"
+		puts("Usage: swm command [args ...]\n"
 		    "Alt-w: close focused window");
 		return (0);
 	}
-	if (argc < 3 || strcmp(argv[1], "-exec") != 0 || argv[2][0] == '\0') {
-		fputs("Usage: swm -exec command [args ...]\n", stderr);
+	if (argc < 2 || argv[1][0] == '\0') {
+		fputs("Usage: swm command [args ...]\n", stderr);
 		return (1);
 	}
 	setlocale(LC_CTYPE, "");
@@ -391,6 +448,13 @@ main(int argc, char **argv)
 	}
 	sw = DisplayWidth(dpy, DefaultScreen(dpy));
 	sh = DisplayHeight(dpy, DefaultScreen(dpy));
+	randr_available = XRRQueryExtension(dpy, &randr_event, &randr_error);
+	if (randr_available)
+		XRRSelectInput(dpy, root, RRScreenChangeNotifyMask);
+	bar_pixel = BlackPixel(dpy, DefaultScreen(dpy));
+	if (XAllocNamedColor(dpy, DefaultColormap(dpy, DefaultScreen(dpy)),
+	    "#303030", &color, &exact))
+		bar_pixel = color.pixel;
 	protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
 	delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
 	take_focus = XInternAtom(dpy, "WM_TAKE_FOCUS", False);
@@ -417,23 +481,49 @@ main(int argc, char **argv)
 		if (children)
 			XFree(children);
 	}
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = reap_children;
-	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-	sigemptyset(&sa.sa_mask);
-	if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-		perror("swm: sigaction");
+	if (watch_child() == -1) {
+		perror("swm: cannot monitor application");
 		XCloseDisplay(dpy);
 		return (1);
 	}
 	/* Finish setting up the window manager before starting the client. */
 	XSync(dpy, False);
-	if (start_application(&argv[2]) == -1) {
+	if (start_application(&argv[1]) == -1) {
 		XCloseDisplay(dpy);
 		return (1);
 	}
+	fds[0] = (struct pollfd){ .fd = ConnectionNumber(dpy),
+	    .events = POLLIN };
+	fds[1] = (struct pollfd){ .fd = child_pipe[0], .events = POLLIN };
+	exit_status = 1;
 	for (;;) {
+		child = waitpid(application_pid, &status, WNOHANG);
+		if (child == application_pid) {
+			exit_status = WIFEXITED(status) ? WEXITSTATUS(status) :
+			    128 + WTERMSIG(status);
+			break;
+		}
+		if (child == -1 && errno != EINTR) {
+			perror("swm: waitpid");
+			break;
+		}
+		if (!XPending(dpy)) {
+			if (poll(fds, 2, -1) == -1 && errno != EINTR) {
+				perror("swm: poll");
+				break;
+			}
+			while (read(child_pipe[0], bytes, sizeof(bytes)) > 0)
+				;
+			continue;
+		}
 		XNextEvent(dpy, &e);
+		if (randr_available && e.type == randr_event +
+		    RRScreenChangeNotify) {
+			XRRUpdateConfiguration(&e);
+			resize_screen(DisplayWidth(dpy, DefaultScreen(dpy)),
+			    DisplayHeight(dpy, DefaultScreen(dpy)));
+			continue;
+		}
 		c = find(e.xany.window);
 		switch (e.type) {
 		case MapRequest:
@@ -473,10 +563,18 @@ main(int argc, char **argv)
 		}
 		case ConfigureNotify:
 			if (e.xconfigure.window == root) {
-				sw = e.xconfigure.width;
-				sh = e.xconfigure.height;
-				for (p = clients; p; p = p->next)
-					layout(p);
+				if (!randr_available)
+					resize_screen(e.xconfigure.width,
+					    e.xconfigure.height);
+			} else {
+				c = find(e.xconfigure.window);
+				if (c && e.xconfigure.window == c->win) {
+					XWindowChanges wc = { .sibling = c->win,
+					    .stack_mode = Above };
+
+					XConfigureWindow(dpy, c->bar,
+					    CWSibling | CWStackMode, &wc);
+				}
 			}
 			break;
 		case Expose:
@@ -512,4 +610,8 @@ main(int argc, char **argv)
 			break;
 		}
 	}
+	XCloseDisplay(dpy);
+	close(child_pipe[0]);
+	close(child_pipe[1]);
+	return (exit_status);
 }
